@@ -1,0 +1,649 @@
+-- Auto Fish V4.0 - Rayfield UI Edition (Refactor & Safety Hardened)
+-- Notes:
+--  - Normalized prints/strings to ASCII to avoid mojibake
+--  - Added guards around optional exploit-only functions (isfolder, writefile, readfile, setfpscap)
+--  - Simplified fishing loop to avoid nested infinite loops
+--  - Wrapped network/event calls in pcall where appropriate
+--  - Kept original behavior and event names; if the remote names are different on the target game,
+--    you'll still need to update getNetworkEvents accordingly.
+
+-- ====== CRITICAL DEPENDENCY VALIDATION ======
+local success, errorMsg = pcall(function()
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local HttpService = game:GetService("HttpService")
+
+    if not Players then error("Critical service missing: Players") end
+    if not RunService then error("Critical service missing: RunService") end
+    if not ReplicatedStorage then error("Critical service missing: ReplicatedStorage") end
+    if not HttpService then error("Critical service missing: HttpService") end
+
+    -- LocalPlayer may be nil if run on the server or too early; prefer to wait but error here if not present.
+    local LocalPlayer = Players.LocalPlayer
+    if not LocalPlayer then error("LocalPlayer not available (script must run in a client context)") end
+
+    return true
+end)
+
+if not success then
+    error("[Auto Fish] Critical dependency check failed: " .. tostring(errorMsg))
+    return
+end
+
+-- ====================================================================
+--                        CORE SERVICES
+-- ====================================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local LocalPlayer = Players.LocalPlayer
+
+-- ====================================================================
+--                    CONFIGURATION
+-- ====================================================================
+local CONFIG_FOLDER = "OptimizedAutoFish"
+local CONFIG_FILE = CONFIG_FOLDER .. "/config_" .. LocalPlayer.UserId .. ".json"
+
+local DefaultConfig = {
+    AutoFish = false,
+    AutoSell = false,
+    AutoCatch = false,
+    GPUSaver = false,
+    BlatantMode = false,
+    FishDelay = 0.9,
+    CatchDelay = 0.2,
+    SellDelay = 30,
+    TeleportLocation = "Sisyphus Statue",
+    AutoFavorite = true,
+    FavoriteRarity = "Mythic"
+}
+
+local Config = {}
+for k, v in pairs(DefaultConfig) do Config[k] = v end
+
+-- Teleport Locations
+local LOCATIONS = {
+    ["Spawn"] = CFrame.new(45.2788086, 252.562927, 2987.10913),
+    ["Sisyphus Statue"] = CFrame.new(-3728.21606, -135.074417, -1012.12744, -0.977224171, 7.74980258e-09, -0.212209702, 1.566994e-08, 1, -3.5640408e-08, 0.212209702, -3.81539813e-08, -0.977224171),
+    ["Coral Reefs"] = CFrame.new(-3114.78198, 1.32066584, 2237.52295),
+    ["Esoteric Depths"] = CFrame.new(3248.37109, -1301.53027, 1403.82727),
+    ["Crater Island"] = CFrame.new(1016.49072, 20.0919304, 5069.27295),
+    ["Lost Isle"] = CFrame.new(-3618.15698, 240.836655, -1317.45801),
+    ["Weather Machine"] = CFrame.new(-1488.51196, 83.1732635, 1876.30298),
+    ["Tropical Grove"] = CFrame.new(-2095.34106, 197.199997, 3718.08008),
+    ["Mount Hallow"] = CFrame.new(2136.62305, 78.9163895, 3272.50439),
+    ["Treasure Room"] = CFrame.new(-3606.34985, -266.57373, -1580.97339),
+    ["Kohana"] = CFrame.new(-663.904236, 3.04580712, 718.796875),
+    ["Underground Cellar"] = CFrame.new(2109.52148, -94.1875076, -708.609131),
+    ["Ancient Jungle"] = CFrame.new(1831.71362, 6.62499952, -299.279175),
+    ["Sacred Temple"] = CFrame.new(1466.92151, -21.8750591, -622.835693)
+}
+
+-- ====================================================================
+--                     CONFIG FUNCTIONS
+-- ====================================================================
+local function ensureFolder()
+    if type(isfolder) ~= "function" or type(makefolder) ~= "function" then
+        return false
+    end
+    if not isfolder(CONFIG_FOLDER) then
+        pcall(function() makefolder(CONFIG_FOLDER) end)
+    end
+    return isfolder(CONFIG_FOLDER)
+end
+
+local function saveConfig()
+    if type(writefile) ~= "function" or not ensureFolder() then return end
+    pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(Config))
+        print("[Config] Settings saved!")
+    end)
+end
+
+local function loadConfig()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" or not isfile(CONFIG_FILE) then return end
+    pcall(function()
+        local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
+        for k, v in pairs(data) do
+            if DefaultConfig[k] ~= nil then Config[k] = v end
+        end
+        print("[Config] Settings loaded!")
+    end)
+end
+
+loadConfig()
+
+-- ====================================================================
+--                     NETWORK EVENTS
+-- ====================================================================
+local function getNetworkEvents()
+    -- Try to safely resolve the net index used by original script.
+    local ok, net = pcall(function()
+        return ReplicatedStorage.Packages._Index["sleitnick_net@0.2.0"].net
+    end)
+    if not ok or not net then
+        warn("[Network] Could not find sleitnick_net@0.2.0.net in ReplicatedStorage.Packages._Index. Falling back to direct lookups (may fail if remotes are named differently).")
+        -- Return nils; callers should pcall remote usage.
+        return {
+            fishing = nil,
+            sell = nil,
+            charge = nil,
+            minigame = nil,
+            cancel = nil,
+            equip = nil,
+            unequip = nil,
+            favorite = nil
+        }
+    end
+
+    -- WaitForChild usage preserved (may yield briefly)
+    local function safeWait(childName)
+        local ok2, res = pcall(function() return net:WaitForChild(childName) end)
+        return ok2 and res or nil
+    end
+
+    return {
+        fishing = safeWait("RE/FishingCompleted"),
+        sell = safeWait("RF/SellAllItems"),
+        charge = safeWait("RF/ChargeFishingRod"),
+        minigame = safeWait("RF/RequestFishingMinigameStarted"),
+        cancel = safeWait("RF/CancelFishingInputs"),
+        equip = safeWait("RE/EquipToolFromHotbar"),
+        unequip = safeWait("RE/UnequipToolFromHotbar"),
+        favorite = safeWait("RE/FavoriteItem")
+    }
+end
+
+local Events = getNetworkEvents()
+
+-- ====================================================================
+--                     MODULES FOR AUTO FAVORITE
+-- ====================================================================
+local ItemUtility = nil
+local Replion = nil
+local PlayerData = nil
+
+pcall(function()
+    ItemUtility = require(ReplicatedStorage.Shared.ItemUtility)
+    Replion = require(ReplicatedStorage.Packages.Replion)
+    if Replion and Replion.Client then
+        PlayerData = Replion.Client:WaitReplion("Data")
+    end
+end)
+
+-- ====================================================================
+--                     RARITY SYSTEM
+-- ====================================================================
+local RarityTiers = {
+    Common = 1,
+    Uncommon = 2,
+    Rare = 3,
+    Epic = 4,
+    Legendary = 5,
+    Mythic = 6,
+    Secret = 7
+}
+
+local function getRarityValue(rarity)
+    return RarityTiers[rarity] or 0
+end
+
+local function getFishRarity(itemData)
+    if not itemData or not itemData.Data then return "Common" end
+    return itemData.Data.Rarity or "Common"
+end
+
+-- ====================================================================
+--                     TELEPORT SYSTEM
+-- ====================================================================
+local Teleport = {}
+
+function Teleport.to(locationName)
+    local cframe = LOCATIONS[locationName]
+    if not cframe then
+        warn("[Teleport] Location not found: " .. tostring(locationName))
+        return false
+    end
+
+    local ok = pcall(function()
+        local character = LocalPlayer.Character
+        if not character then return end
+        local root = character:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        root.CFrame = cframe
+    end)
+    if ok then
+        print("[Teleport] Moved to " .. tostring(locationName))
+    end
+    return ok
+end
+
+-- ====================================================================
+--                     GPU SAVER
+-- ====================================================================
+local gpuActive = false
+local whiteScreen = nil
+
+local function enableGPU()
+    if gpuActive then return end
+    gpuActive = true
+
+    pcall(function()
+        if pcall(function() return settings().Rendering end) then
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+        end
+        if game.Lighting then
+            game.Lighting.GlobalShadows = false
+            game.Lighting.FogEnd = 1
+        end
+        if type(setfpscap) == "function" then
+            pcall(function() setfpscap(8) end)
+        end
+    end)
+
+    -- Simple low-overhead overlay
+    whiteScreen = Instance.new("ScreenGui")
+    whiteScreen.Name = "AutoFishGPUSaver"
+    whiteScreen.ResetOnSpawn = false
+    whiteScreen.DisplayOrder = 999999
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 1, 0)
+    frame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    frame.BackgroundTransparency = 0
+    frame.Parent = whiteScreen
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 420, 0, 120)
+    label.Position = UDim2.new(0.5, -210, 0.5, -60)
+    label.BackgroundTransparency = 1
+    label.Text = "GPU SAVER ACTIVE\nAuto Fish Running..."
+    label.TextColor3 = Color3.new(0, 1, 0)
+    label.TextSize = 22
+    label.Font = Enum.Font.GothamBold
+    label.TextXAlignment = Enum.TextXAlignment.Center
+    label.Parent = frame
+
+    whiteScreen.Parent = game.CoreGui
+    print("[GPU] GPU Saver enabled")
+end
+
+local function disableGPU()
+    if not gpuActive then return end
+    gpuActive = false
+
+    pcall(function()
+        if pcall(function() return settings().Rendering end) then
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+        end
+        if game.Lighting then
+            game.Lighting.GlobalShadows = true
+            game.Lighting.FogEnd = 100000
+        end
+        if type(setfpscap) == "function" then
+            pcall(function() setfpscap(0) end)
+        end
+    end)
+
+    if whiteScreen then
+        pcall(function() whiteScreen:Destroy() end)
+        whiteScreen = nil
+    end
+    print("[GPU] GPU Saver disabled")
+end
+
+-- ====================================================================
+--                     ANTI-AFK
+-- ====================================================================
+if VirtualUser and LocalPlayer and LocalPlayer.Idled then
+    LocalPlayer.Idled:Connect(function()
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end)
+    print("[Anti-AFK] Protection enabled")
+end
+
+-- ====================================================================
+--                     AUTO FAVORITE
+-- ====================================================================
+local favoritedItems = {}
+
+local function isItemFavorited(uuid)
+    if not PlayerData then return false end
+    local ok, result = pcall(function()
+        local items = PlayerData:GetExpect("Inventory").Items
+        for _, item in ipairs(items) do
+            if item.UUID == uuid then
+                return item.Favorited == true
+            end
+        end
+        return false
+    end)
+    return ok and result or false
+end
+
+local function autoFavoriteByRarity()
+    if not Config.AutoFavorite or not PlayerData or not ItemUtility then return end
+
+    local targetRarity = Config.FavoriteRarity
+    local targetValue = getRarityValue(targetRarity)
+
+    -- Ensure we at least target Mythic as original script intended when user chooses lower
+    if targetValue < 6 then targetValue = 6 end
+
+    local favoritedCount, skipped = 0, 0
+    pcall(function()
+        local items = PlayerData:GetExpect("Inventory").Items
+        if not items or #items == 0 then return end
+
+        for _, item in ipairs(items) do
+            local data = ItemUtility:GetItemData(item.Id)
+            if data and data.Data then
+                local itemName = data.Data.Name or "Unknown"
+                local rarity = getFishRarity(data)
+                local rarityValue = getRarityValue(rarity)
+
+                if rarityValue >= targetValue then
+                    if not isItemFavorited(item.UUID) and not favoritedItems[item.UUID] and Events.favorite then
+                        pcall(function()
+                            Events.favorite:FireServer(item.UUID)
+                        end)
+                        favoritedItems[item.UUID] = true
+                        favoritedCount = favoritedCount + 1
+                        print(string.format("[Auto Favorite] #%d - %s (%s)", favoritedCount, itemName, rarity))
+                        task.wait(0.3)
+                    else
+                        skipped = skipped + 1
+                    end
+                end
+            end
+        end
+    end)
+
+    if favoritedCount > 0 then
+        print("[Auto Favorite] Complete! Favorited: " .. favoritedCount .. " (skipped " .. skipped .. ")")
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(10)
+        if Config.AutoFavorite then
+            pcall(autoFavoriteByRarity)
+        end
+    end
+end)
+
+-- ====================================================================
+--                     FISHING LOGIC
+-- ====================================================================
+local isFishing = false
+local fishingActive = false
+
+local function castRod()
+    pcall(function()
+        if Events.equip then Events.equip:FireServer(1) end
+        task.wait(0.05)
+        if Events.charge then Events.charge:InvokeServer(1755848498.4834) end
+        task.wait(0.02)
+        if Events.minigame then Events.minigame:InvokeServer(1.2854545116425, 1) end
+        print("[Fishing] Cast")
+    end)
+end
+
+local function reelIn()
+    pcall(function()
+        if Events.fishing then Events.fishing:FireServer() end
+        print("[Fishing] Reel")
+    end)
+end
+
+-- Execute a single blatant cycle (no internal infinite loops)
+local function blatantCycle()
+    if isFishing then return end
+    isFishing = true
+    pcall(function()
+        if Events.equip then Events.equip:FireServer(1) end
+        task.wait(0.01)
+        -- Overlapped casts using task.spawn
+        if Events.charge and Events.minigame then
+            task.spawn(function()
+                pcall(function()
+                    Events.charge:InvokeServer(1755848498.4834)
+                    task.wait(0.01)
+                    Events.minigame:InvokeServer(1.2854545116425, 1)
+                end)
+            end)
+            task.wait(0.05)
+            task.spawn(function()
+                pcall(function()
+                    Events.charge:InvokeServer(1755848498.4834)
+                    task.wait(0.01)
+                    Events.minigame:InvokeServer(1.2854545116425, 1)
+                end)
+            end)
+        else
+            -- Fallback: single cast
+            castRod()
+        end
+
+        -- Wait for bite
+        task.wait(math.max(0.01, tonumber(Config.FishDelay) or 0.9))
+
+        -- Spam reel a few times to ensure catch
+        for i = 1, 5 do
+            pcall(function()
+                if Events.fishing then Events.fishing:FireServer() end
+            end)
+            task.wait(0.01)
+        end
+
+        -- Short cooldown
+        task.wait(math.max(0, (tonumber(Config.CatchDelay) or 0.2) * 0.5))
+        print("[Blatant] Cycle complete")
+    end)
+    isFishing = false
+end
+
+-- Execute a single normal cycle
+local function normalCycle()
+    if isFishing then return end
+    isFishing = true
+    pcall(function()
+        castRod()
+        task.wait(math.max(0.01, tonumber(Config.FishDelay) or 0.9))
+        reelIn()
+        task.wait(math.max(0, tonumber(Config.CatchDelay) or 0.2))
+    end)
+    isFishing = false
+end
+
+-- Central fishing loop that schedules individual cycles
+local function fishingLoop()
+    while fishingActive do
+        if Config.BlatantMode then
+            blatantCycle()
+        else
+            normalCycle()
+        end
+        -- tiny sleep so we don't tight-loop if something goes wrong
+        task.wait(0.05)
+    end
+end
+
+-- ====================================================================
+--                     AUTO CATCH (SPAM SYSTEM)
+-- ====================================================================
+task.spawn(function()
+    while true do
+        if Config.AutoCatch and not isFishing then
+            pcall(function()
+                if Events.fishing then Events.fishing:FireServer() end
+            end)
+        end
+        task.wait(math.max(0.05, tonumber(Config.CatchDelay) or 0.2))
+    end
+end)
+
+-- ====================================================================
+--                     AUTO SELL
+-- ====================================================================
+local function simpleSell()
+    print("--------------------------------------------------")
+    print("[Auto Sell] Selling all non-favorited items...")
+
+    local sellSuccess = false
+    local ok = pcall(function()
+        if Events.sell and Events.sell.InvokeServer then
+            sellSuccess = Events.sell:InvokeServer()
+        elseif Events.sell and Events.sell.FireServer then
+            -- If sell is a RemoteEvent pattern
+            Events.sell:FireServer()
+            sellSuccess = true
+        end
+    end)
+
+    if ok and sellSuccess then
+        print("[Auto Sell] SOLD! (Favorited items kept)")
+    elseif ok and sellSuccess == false then
+        -- Some sell remotes return nil/false; still consider it done but warn
+        print("[Auto Sell] Sell invoked (no success flag returned)")
+    else
+        warn("[Auto Sell] Sell invocation failed")
+    end
+    print("--------------------------------------------------")
+end
+
+task.spawn(function()
+    while true do
+        task.wait(math.max(1, tonumber(Config.SellDelay) or 30))
+        if Config.AutoSell then
+            pcall(simpleSell)
+        end
+    end
+end)
+
+-- ====================================================================
+--                     RAYFIELD UI (lazy-load)
+-- ====================================================================
+local successRay, Rayfield = pcall(function()
+    return loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+end)
+
+if not successRay or not Rayfield then
+    warn("[UI] Rayfield could not be loaded. UI features will be unavailable.")
+else
+    local Window = Rayfield:CreateWindow({
+        Name = "Auto Fish V4.0",
+        LoadingTitle = "Ultra-Fast Fishing",
+        LoadingSubtitle = "Working Method Implementation",
+        ConfigurationSaving = {
+            Enabled = false
+        }
+    })
+
+    local MainTab = Window:CreateTab("Main", 4483362458)
+    MainTab:CreateSection("Auto Fishing")
+
+    local BlatantToggle = MainTab:CreateToggle({
+        Name = "BLATANT MODE (3x Faster!)",
+        CurrentValue = Config.BlatantMode,
+        Callback = function(value)
+            Config.BlatantMode = value
+            print("[Blatant Mode] " .. (value and "ENABLED - SUPER FAST!" or "Disabled - Normal speed"))
+            saveConfig()
+        end
+    })
+
+    local AutoFishToggle = MainTab:CreateToggle({
+        Name = "Auto Fish",
+        CurrentValue = Config.AutoFish,
+        Callback = function(value)
+            Config.AutoFish = value
+            fishingActive = value
+
+            if value then
+                print("[Auto Fish] Started " .. (Config.BlatantMode and "(BLATANT MODE)" or "(Normal)"))
+                task.spawn(fishingLoop)
+            else
+                print("[Auto Fish] Stopped")
+                pcall(function() if Events.unequip then Events.unequip:FireServer() end end)
+            end
+
+            saveConfig()
+        end
+    })
+
+    local AutoCatchToggle = MainTab:CreateToggle({
+        Name = "Auto Catch (Extra Speed)",
+        CurrentValue = Config.AutoCatch,
+        Callback = function(value)
+            Config.AutoCatch = value
+            print("[Auto Catch] " .. (value and "Enabled" or "Disabled"))
+            saveConfig()
+        end
+    })
+
+    MainTab:CreateInput({
+        Name = "Fish Delay (seconds)",
+        PlaceholderText = "Default: 0.9",
+        RemoveTextAfterFocusLost = false,
+        Callback = function(value)
+            local num = tonumber(value)
+            if num and num >= 0.1 and num <= 10 then
+                Config.FishDelay = num
+                print("[Config] Fish delay set to " .. num .. "s")
+                saveConfig()
+            else
+                warn("[Config] Invalid delay (must be 0.1-10)")
+            end
+        end
+    })
+
+    MainTab:CreateInput({
+        Name = "Catch Delay (seconds)",
+        PlaceholderText = "Default: 0.2",
+        RemoveTextAfterFocusLost = false,
+        Callback = function(value)
+            local num = tonumber(value)
+            if num and num >= 0.05 and num <= 10 then
+                Config.CatchDelay = num
+                print("[Config] Catch delay set to " .. num .. "s")
+                saveConfig()
+            else
+                warn("[Config] Invalid delay (must be 0.05-10)")
+            end
+        end
+    })
+
+    MainTab:CreateSection("Auto Sell")
+
+    local AutoSellToggle = MainTab:CreateToggle({
+        Name = "Auto Sell (Keeps Favorited)",
+        CurrentValue = Config.AutoSell,
+        Callback = function(value)
+            Config.AutoSell = value
+            print("[Auto Sell] " .. (value and "Enabled" or "Disabled"))
+            saveConfig()
+        end
+    })
+
+    -- GPU Saver toggle
+    MainTab:CreateSection("Performance")
+    local GPUSaverToggle = MainTab:CreateToggle({
+        Name = "GPU Saver",
+        CurrentValue = Config.GPUSaver,
+        Callback = function(value)
+            Config.GPUSaver = value
+            if value then enableGPU() else disableGPU() end
+            saveConfig()
+        end
+    })
+end
+
+-- End of script
